@@ -63,11 +63,14 @@ def _process_row(
     reporter: Reporter,
     dataset_name: str,
     log: logging.Logger,
-) -> None:
+) -> "Path | None":
     """
     Process one card: download Excel, open View Table, scrape it, compare.
     Nothing should escape this function; on any error we record the failure
     and force-navigate back to dataset_url so the next card can proceed.
+
+    Returns the path of the downloaded Excel (or None on download failure)
+    so the caller can clean it up once the dataset is finished.
     """
     table_name = row_meta.get("table_name", f"Table_{row_index}")
     table_no   = row_meta.get("table_no",   str(row_index + 1))
@@ -115,6 +118,8 @@ def _process_row(
         log.error("      ✗ Compare/report failed: %s", exc, exc_info=True)
         reporter.add_error(dataset_name, label, f"compare failed: {exc}")
 
+    return excel_path
+
 
 def run() -> None:
     for d in [config.DOWNLOAD_DIR, config.REPORT_DIR, config.LOG_DIR, config.SCREENSHOT_DIR]:
@@ -161,6 +166,8 @@ def run() -> None:
                 log.info("Dataset %d/%d: %s", ds_idx + 1, len(datasets), ds_name)
                 log.info("━" * 70)
 
+                downloaded: list[Path] = []  # cleaned up after this dataset
+
                 try:
                     # Navigate back to catalogue if needed
                     if config.CATALOGUE_URL not in bm.page.url:
@@ -186,10 +193,12 @@ def run() -> None:
                         dataset_url = bm.page.url  # remember for recovery
 
                         for row_idx, row_meta in enumerate(rows):
-                            _process_row(
+                            excel_path = _process_row(
                                 bm, dp, row_idx, row_meta,
                                 dataset_url, reporter, ds_name, log,
                             )
+                            if excel_path:
+                                downloaded.append(excel_path)
                             # Re-wait for table after returning from View Table
                             try:
                                 dp.wait_for_table()
@@ -214,6 +223,18 @@ def run() -> None:
                         time.sleep(1)
                     except Exception:
                         pass
+
+                    # Delete this dataset's Excel downloads — they've already
+                    # been compared and the report holds the diffs.
+                    removed = 0
+                    for p in downloaded:
+                        try:
+                            p.unlink(missing_ok=True)
+                            removed += 1
+                        except Exception as exc:
+                            log.warning("Could not delete %s: %s", p, exc)
+                    if downloaded:
+                        log.info("Cleaned up %d/%d Excel file(s) for dataset", removed, len(downloaded))
 
     except Exception as exc:
         log.critical("Fatal error: %s", exc, exc_info=True)

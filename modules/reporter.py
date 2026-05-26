@@ -137,7 +137,11 @@ class Reporter:
         ws = wb.create_sheet("Mismatches", 1)
         ws.freeze_panes = "A2"
 
-        cols = ["Dataset", "Table No.", "Table Name", "Row #", "Column", "Excel Value", "Web Value"]
+        cols = [
+            "Dataset", "Table No.", "Table Name",
+            "Excel Cell", "Row #", "Row Label", "Column",
+            "Excel Value", "Web Value",
+        ]
         for ci, h in enumerate(cols, 1):
             _hdr(ws.cell(row=1, column=ci, value=h))
 
@@ -150,19 +154,21 @@ class Reporter:
                 ws.cell(rn, 1, entry["dataset"])
                 ws.cell(rn, 2, meta.get("table_no",   ""))
                 ws.cell(rn, 3, meta.get("table_name", ""))
-                ws.cell(rn, 4, mm.row)
-                ws.cell(rn, 5, mm.column)
+                ws.cell(rn, 4, mm.excel_cell)
+                ws.cell(rn, 5, mm.row)
+                ws.cell(rn, 6, mm.row_label)
+                ws.cell(rn, 7, mm.column)
 
-                ec = ws.cell(rn, 6, mm.excel_value)
+                ec = ws.cell(rn, 8, mm.excel_value)
                 ec.fill = PatternFill("solid", fgColor=_LIGHT_RED)
                 ec.font = Font(color=_DARK_RED)
 
-                wc = ws.cell(rn, 7, mm.web_value)
+                wc = ws.cell(rn, 9, mm.web_value)
                 wc.fill = PatternFill("solid", fgColor=_LIGHT_AMBER)
                 wc.font = Font(color=_DARK_AMBER)
 
                 if rn % 2 == 0:
-                    for ci in [1, 2, 3, 4, 5]:
+                    for ci in [1, 2, 3, 4, 5, 6, 7]:
                         ws.cell(rn, ci).fill = PatternFill("solid", fgColor=_LIGHT_GRAY)
                 rn += 1
 
