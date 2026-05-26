@@ -1,0 +1,253 @@
+import logging
+import re
+import time
+from pathlib import Path
+from typing import Dict, List, Optional
+
+from playwright.sync_api import Download, Page
+
+log = logging.getLogger(__name__)
+
+
+class DatasetPage:
+    """
+    Handles the MoSPI catalogue dataset listing page.
+
+    Real DOM structure (per card):
+        <div class="catalog-grid">
+            <h5 class="title">{table name}</h5>
+            <ul class="gridTable">
+                <li><p><span>Product:</span> IIP</p></li>
+                <li><p><span>Category:</span> Industrial Statistics</p></li>
+                <li><p><span>Geography:</span> All India</p></li>
+                <li><p><span>Frequency:</span> Monthly</p></li>
+                <li><p><span>Reference Period:</span> Mar 2026</p></li>
+                <li><p><span>Data Source:</span> ...</p></li>
+                <li class="product-desc"><p><span>Description:</span> ...</p></li>
+                <li class="product-id"><p><span>Release Date:</span> 28 Apr 2026</p></li>
+                <li class="product-id"><p><span>Table No.</span> IIPMFY25045MAR</p></li>
+            </ul>
+            <div class="grid-action">
+                <button>View Table</button>
+                <button>View Chart</button>
+                <a href="/datacatalogue/.../*.xlsx" download="">...</a>
+            </div>
+        </div>
+
+    Pagination (MUI):
+        <p class="MuiTablePagination-displayedRows">1–10 of 436</p>
+        <button aria-label="Go to next page">...</button>
+    """
+
+    CARD_SEL          = "div.catalog-grid"
+    TITLE_SEL         = "h5.title"
+    INFO_ITEM_SEL     = "ul.gridTable > li"
+    DOWNLOAD_SEL      = "div.grid-action a[download]"
+    VIEW_TABLE_SEL    = "div.grid-action button:has-text('View Table')"
+
+    PAGINATION_TEXT   = "p.MuiTablePagination-displayedRows"
+    NEXT_PAGE_BTN     = "button[aria-label='Go to next page']"
+    PREV_PAGE_BTN     = "button[aria-label='Go to previous page']"
+
+    # `<li>` prefix → meta-dict field name
+    FIELD_PREFIXES = {
+        "Product:":      "product",
+        "Category:":     "category",
+        "Release Date:": "release_date",
+        "Table No.":     "table_no",
+    }
+
+    def __init__(self, page: Page, download_dir: Path):
+        self.page = page
+        self.download_dir = download_dir
+
+    # ── Waiting ───────────────────────────────────────────────────────────────
+
+    def wait_for_cards(self) -> None:
+        self.page.wait_for_selector(self.CARD_SEL, timeout=30_000)
+        time.sleep(0.5)
+
+    # Back-compat alias for main.py
+    wait_for_table = wait_for_cards
+
+    # ── Pagination ────────────────────────────────────────────────────────────
+
+    def _pagination_text(self) -> str:
+        try:
+            return self.page.locator(self.PAGINATION_TEXT).first.inner_text().strip()
+        except Exception:
+            return ""
+
+    def get_total_records(self) -> int:
+        """Parse '1–10 of 436' → 436."""
+        m = re.search(r"of\s+([\d,]+)", self._pagination_text())
+        return int(m.group(1).replace(",", "")) if m else 0
+
+    def get_total_pages(self, rows_per_page: int = 10) -> int:
+        total = self.get_total_records()
+        if total <= 0:
+            return 1
+        return (total + rows_per_page - 1) // rows_per_page
+
+    def _is_disabled(self, locator) -> bool:
+        try:
+            if locator.count() == 0:
+                return True
+            cls = locator.first.get_attribute("class") or ""
+            return "Mui-disabled" in cls or locator.first.is_disabled()
+        except Exception:
+            return True
+
+    def has_next_page(self) -> bool:
+        return not self._is_disabled(self.page.locator(self.NEXT_PAGE_BTN))
+
+    def go_to_next_page(self) -> bool:
+        if not self.has_next_page():
+            log.info("No next page — at end of listing")
+            return False
+        try:
+            self.page.locator(self.NEXT_PAGE_BTN).first.click()
+            self.page.wait_for_load_state("networkidle")
+            # MUI re-renders cards; give the DOM a moment to settle
+            time.sleep(1)
+            self.wait_for_cards()
+            log.info("Navigated to next listing page")
+            return True
+        except Exception as e:
+            log.warning("Next-page click failed: %s", e)
+            return False
+
+    # ── Rows / metadata ───────────────────────────────────────────────────────
+
+    def get_row_count(self) -> int:
+        return self.page.locator(self.CARD_SEL).count()
+
+    def get_rows(self) -> List[Dict]:
+        """Return metadata dicts for every card on the current page."""
+        cards = self.page.locator(self.CARD_SEL)
+        n = cards.count()
+        results: List[Dict] = []
+
+        for i in range(n):
+            card = cards.nth(i)
+
+            try:
+                title = card.locator(self.TITLE_SEL).first.inner_text().strip()
+            except Exception:
+                title = ""
+
+            meta: Dict = {
+                "row_index":    i,
+                "table_name":   title,
+                "product":      "",
+                "category":     "",
+                "release_date": "",
+                "table_no":     "",
+            }
+
+            try:
+                for li in card.locator(self.INFO_ITEM_SEL).all():
+                    text = li.inner_text().strip()
+                    for prefix, field in self.FIELD_PREFIXES.items():
+                        if text.startswith(prefix):
+                            meta[field] = text[len(prefix):].strip()
+                            break
+            except Exception as e:
+                log.debug("Card %d: metadata parse failed: %s", i, e)
+
+            results.append(meta)
+
+        log.info("Read metadata for %d cards on this page", len(results))
+        return results
+
+    # ── Actions ──────────────────────────────────────────────────────────────
+
+    def download_excel(self, row_index: int, table_name: str, table_no: str) -> Optional[Path]:
+        """
+        Click the download link and wait for the file to land on disk.
+        Uses Playwright's expect_download — the `download` attribute on the
+        <a> prevents navigation, so the page stays put.
+
+        After the download completes we re-wait for the cards before
+        returning, so the caller can safely interact with View Table next.
+        """
+        safe = (f"{table_no}_{table_name}"[:80]
+                .replace("/", "_").replace("\\", "_")
+                .replace(" ", "_").replace(":", "_").replace("?", ""))
+        dest = self.download_dir / f"{safe}.xlsx"
+
+        card = self.page.locator(self.CARD_SEL).nth(row_index)
+        link = card.locator(self.DOWNLOAD_SEL).first
+
+        if link.count() == 0:
+            log.error("No download link on card %d", row_index)
+            return None
+
+        try:
+            log.info("Downloading Excel for [%s] %s", table_no, table_name)
+            try:
+                link.scroll_into_view_if_needed(timeout=5_000)
+            except Exception:
+                pass
+
+            with self.page.expect_download(timeout=90_000) as dl_info:
+                link.click(timeout=15_000)
+            download: Download = dl_info.value
+            download.save_as(str(dest))
+            log.info("Saved to: %s", dest)
+
+            # Give the page a moment to settle (React/MUI re-render after click)
+            try:
+                self.wait_for_cards()
+            except Exception:
+                pass
+            return dest
+        except Exception as e:
+            log.error("Download failed for card %d: %s", row_index, e)
+            # Even on failure, try to leave the page in a usable state
+            try:
+                self.wait_for_cards()
+            except Exception:
+                pass
+            return None
+
+    def click_view_table(self, row_index: int) -> Optional[Page]:
+        """
+        Click the 'View Table' button. On MoSPI this always loads in the
+        same tab at /catalogue-main/catalogue/tableview/{id}, so we drop the
+        new-tab detection and just wait for the URL change.
+
+        Always returns None (kept Optional[Page] for caller compatibility).
+        """
+        self.wait_for_cards()
+
+        card = self.page.locator(self.CARD_SEL).nth(row_index)
+        btn = card.locator(self.VIEW_TABLE_SEL).first
+
+        log.info("Clicking View Table (card %d)", row_index)
+
+        try:
+            btn.wait_for(state="visible", timeout=15_000)
+        except Exception as e:
+            raise RuntimeError(f"View Table button not visible on card {row_index}: {e}")
+
+        try:
+            btn.scroll_into_view_if_needed(timeout=5_000)
+        except Exception:
+            pass
+
+        try:
+            btn.click(timeout=15_000)
+        except Exception as e:
+            log.warning("Normal click failed on card %d (%s) — retrying with force=True", row_index, e)
+            btn.click(force=True, timeout=10_000)
+
+        try:
+            self.page.wait_for_url("**/tableview/**", timeout=30_000)
+        except Exception:
+            # Some installations may navigate differently; fall back to load-state
+            self.page.wait_for_load_state("networkidle", timeout=15_000)
+
+        time.sleep(0.5)
+        log.info("View Table loaded: %s", self.page.url)
+        return None
