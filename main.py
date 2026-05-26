@@ -16,7 +16,7 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 import config
 from modules.browser import BrowserManager
@@ -143,7 +143,7 @@ def _pick_report_path(continue_run: bool, log: logging.Logger) -> Path:
     return config.REPORT_DIR / f"comparison_report_{ts}.xlsx"
 
 
-def run(continue_run: bool = False) -> None:
+def run(continue_run: bool = False, rerun_datasets: Optional[List[str]] = None) -> None:
     for d in [config.DOWNLOAD_DIR, config.REPORT_DIR, config.LOG_DIR, config.SCREENSHOT_DIR]:
         d.mkdir(parents=True, exist_ok=True)
 
@@ -154,6 +154,16 @@ def run(continue_run: bool = False) -> None:
 
     report_path = _pick_report_path(continue_run, log)
     reporter = Reporter(report_path=report_path)
+
+    rerun_datasets = rerun_datasets or []
+    for name in rerun_datasets:
+        removed = reporter.drop_dataset(name)
+        log.info(
+            "Dropped %d existing entries for dataset %r - will reprocess from scratch",
+            removed, name,
+        )
+    if rerun_datasets:
+        reporter.save()  # persist the drops immediately
 
     skip_datasets = reporter.completed_datasets()
     skip_tables   = reporter.completed_tables()
@@ -305,5 +315,13 @@ if __name__ == "__main__":
         "--continue", dest="continue_run", action="store_true",
         help="Resume the most recent report, skipping completed datasets/tables.",
     )
+    parser.add_argument(
+        "--rerun", dest="rerun_datasets", action="append", default=[],
+        metavar="DATASET_NAME",
+        help='Drop existing entries for this dataset and reprocess it. '
+             'May be passed multiple times to redo several datasets in one run. '
+             'Examples: --rerun "INDEX OF INDUSTRIAL PRODUCTION IIP" '
+             '--rerun "CONSUMER PRICE INDEX CPI". Use with --continue.',
+    )
     args = parser.parse_args()
-    run(continue_run=args.continue_run)
+    run(continue_run=args.continue_run, rerun_datasets=args.rerun_datasets)

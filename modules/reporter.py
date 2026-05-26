@@ -79,6 +79,19 @@ class Reporter:
         """Flag a dataset as fully processed (all pages iterated)."""
         self._completed_datasets.add(dataset_name)
 
+    def drop_dataset(self, dataset_name: str) -> int:
+        """
+        Remove every entry whose 'dataset' equals `dataset_name`, and
+        unmark the dataset as complete. Used by `--rerun NAME` so that
+        next run reprocesses the dataset under fresh comparator logic
+        without losing other datasets' progress. Returns count removed.
+        """
+        before = len(self._entries)
+        self._entries = [e for e in self._entries if e["dataset"] != dataset_name]
+        removed = before - len(self._entries)
+        self._completed_datasets.discard(dataset_name)
+        return removed
+
     def completed_datasets(self) -> Set[str]:
         return set(self._completed_datasets)
 

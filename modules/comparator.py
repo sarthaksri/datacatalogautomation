@@ -1,10 +1,77 @@
 import logging
+import re
 from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Dict, List, Optional, Tuple
 
 from openpyxl.utils import get_column_letter
 
 log = logging.getLogger(__name__)
+
+_MONTH_NAMES = {
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4,  "may": 5,  "jun": 6,
+    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+}
+
+# Tokens that mean "no value" in MoSPI tables. Excel typically leaves the
+# cell blank; the Datawrapper-rendered web table sometimes literally
+# writes "(null)" or "NA" instead. Treat all of these as equivalent.
+_NULL_TOKENS = {"", "(null)", "null", "none", "n/a", "na", "-", "--",
+                "–", "—"}  # en-dash, em-dash
+
+
+def _is_null(s: str) -> bool:
+    return s.strip().lower() in _NULL_TOKENS
+_ISO_DATE_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})(?:[ T]\d{2}:\d{2}:\d{2})?$")
+_MMM_YY_RE   = re.compile(r"^([A-Za-z]{3})[-\s/]?(\d{2,4})$")
+
+
+def _to_month_year(s: str) -> Optional[Tuple[int, int]]:
+    """
+    Parse a string as (year, month) if it looks like a month-year token.
+    Recognises 'Apr-12', 'Apr-2012', 'Apr 12' and ISO timestamps like
+    '2012-04-11 00:00:00' (any day - we ignore it). Returns None otherwise.
+
+    This is the bridge between pandas' stringified-datetime headers from
+    Excel ('2012-04-11 00:00:00') and the human-friendly 'Apr-12' the
+    Datawrapper CSV uses for monthly columns on IIP tables.
+    """
+    s = s.strip()
+    m = _ISO_DATE_RE.match(s)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    m = _MMM_YY_RE.match(s)
+    if m:
+        mname = m.group(1).lower()
+        if mname in _MONTH_NAMES:
+            year = int(m.group(2))
+            if year < 100:
+                year += 2000 if year < 50 else 1900
+            return year, _MONTH_NAMES[mname]
+    return None
+
+
+def _decimals(s: str) -> int:
+    """Count significant decimal places in a numeric string (ignores trailing zeros)."""
+    s = s.replace(",", "").strip()
+    if "." not in s:
+        return 0
+    return len(s.split(".", 1)[1].rstrip("0"))
+
+
+def _round_half_up(num_str: str, ndigits: int) -> Optional[Decimal]:
+    """
+    Round a numeric string to `ndigits` decimals using HALF_UP (away from zero).
+    Necessary because Python's built-in round() uses banker's rounding,
+    which would round '0.79845' to '0.7984' while spreadsheets and the
+    MoSPI web tables both round to '0.7985'.
+    """
+    try:
+        d = Decimal(num_str.replace(",", "").strip())
+    except (InvalidOperation, AttributeError):
+        return None
+    quant = Decimal("1") if ndigits <= 0 else Decimal(10) ** -ndigits
+    return d.quantize(quant, rounding=ROUND_HALF_UP)
 
 
 def _norm(val) -> str:
@@ -30,17 +97,55 @@ def _values_equal(a: str, b: str) -> bool:
     """
     True if two cell values represent the same content.
 
-    Exact string match wins. If both sides parse as numbers, compare
-    numerically so trailing-zero formatting differences ("104" vs "104.00",
-    "1.5" vs "1.50", "-4.8" vs "-4.80") aren't flagged as mismatches.
-    Non-numeric values fall back to plain string equality.
+    Layers, in order:
+      1. Exact string match.
+      2. Month-year tokens: 'Apr-12' equals '2012-04-11 00:00:00' (the
+         day part of pandas-stringified Excel dates is irrelevant for
+         the monthly columns MoSPI uses on IIP tables).
+      3. Strict numeric equality: '104' equals '104.00', '-4.8' equals
+         '-4.80'.
+      4. Rounded-precision tolerance: when one side carries higher
+         precision than the other (and the lower side is >= 2 dp), they
+         agree if the higher rounds to the lower within half its last
+         digit. Catches IIP weights where Excel keeps full precision
+         like '5.302468' but the web table renders '5.3025'.
+      5. Otherwise, not equal.
     """
     if a == b:
         return True
+
+    # Both sides represent "no data" (empty cell, "(null)", "NA", "-", etc.)
+    if _is_null(a) and _is_null(b):
+        return True
+
+    ma, mb = _to_month_year(a), _to_month_year(b)
+    if ma is not None and mb is not None:
+        return ma == mb
+
     try:
-        return float(a.replace(",", "")) == float(b.replace(",", ""))
+        na = float(a.replace(",", ""))
+        nb = float(b.replace(",", ""))
     except (ValueError, AttributeError):
         return False
+    if na == nb:
+        return True
+
+    da, db = _decimals(a), _decimals(b)
+    if da == db:
+        return False  # same precision, values genuinely differ
+    target_dp = min(da, db)
+    ra = _round_half_up(a, target_dp)
+    rb = _round_half_up(b, target_dp)
+    if ra is None or rb is None:
+        return False
+    return ra == rb
+
+
+def _headers_equal(a: List[str], b: List[str]) -> bool:
+    """Same as `a == b` but using `_values_equal` per slot (so 'Apr-12' == '2012-04-11 00:00:00')."""
+    if len(a) != len(b):
+        return False
+    return all(_values_equal(x, y) for x, y in zip(a, b))
 
 
 def _row_label(row: List[str], col_idx: int) -> str:
@@ -174,14 +279,16 @@ def compare(excel_data: Optional[Dict], web_data: Optional[Dict]) -> ComparisonR
                 return result
 
     # ── Column comparison ────────────────────────────────────────────────────
-    if excel_hdrs != web_hdrs:
+    if not _headers_equal(excel_hdrs, web_hdrs):
         log.warning("Column mismatch:\n  Excel: %s\n  Web:   %s", excel_hdrs, web_hdrs)
         result.col_mismatch = True
         # Report by named headers only; empty headers are merged-cell artefacts.
+        # Use semantic equality so 'Apr-12' isn't listed as missing just because
+        # the Excel side stringified it as '2012-04-11 00:00:00'.
         ex_named = [h for h in excel_hdrs if h]
         wb_named = [h for h in web_hdrs   if h]
-        result.missing_cols = [h for h in ex_named if h not in wb_named]
-        result.extra_cols   = [h for h in wb_named if h not in ex_named]
+        result.missing_cols = [h for h in ex_named if not any(_values_equal(h, w) for w in wb_named)]
+        result.extra_cols   = [h for h in wb_named if not any(_values_equal(h, e) for e in ex_named)]
 
     result.total_rows = max(len(excel_rows), len(web_rows))
     result.total_cols = max(len(excel_hdrs), len(web_hdrs))
