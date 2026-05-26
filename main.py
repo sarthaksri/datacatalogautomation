@@ -6,14 +6,17 @@ Navigates every dataset on the catalogue page, iterates all table rows
 and produces a cell-level comparison report.
 
 Usage:
-    python main.py
+    python main.py             # fresh run
+    python main.py --continue  # resume the most recent report
 """
 
+import argparse
 import logging
 import sys
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 import config
 from modules.browser import BrowserManager
@@ -121,16 +124,44 @@ def _process_row(
     return excel_path
 
 
-def run() -> None:
+def _pick_report_path(continue_run: bool, log: logging.Logger) -> Path:
+    """
+    Decide where this run's report goes. With --continue, reuse the newest
+    report in REPORT_DIR so its prior entries / Completed sheet are loaded
+    by Reporter. Otherwise mint a new timestamped filename.
+    """
+    if continue_run:
+        existing = sorted(
+            config.REPORT_DIR.glob("comparison_report_*.xlsx"),
+            key=lambda p: p.stat().st_mtime,
+        )
+        if existing:
+            log.info("Continuing previous run from: %s", existing[-1])
+            return existing[-1]
+        log.info("--continue requested but no prior report found; starting fresh")
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return config.REPORT_DIR / f"comparison_report_{ts}.xlsx"
+
+
+def run(continue_run: bool = False) -> None:
     for d in [config.DOWNLOAD_DIR, config.REPORT_DIR, config.LOG_DIR, config.SCREENSHOT_DIR]:
         d.mkdir(parents=True, exist_ok=True)
 
     log = _setup_logging()
     log.info("=" * 70)
-    log.info("MoSPI Data Catalogue Automation — starting")
+    log.info("MoSPI Data Catalogue Automation — starting (continue=%s)", continue_run)
     log.info("=" * 70)
 
-    reporter = Reporter()
+    report_path = _pick_report_path(continue_run, log)
+    reporter = Reporter(report_path=report_path)
+
+    skip_datasets = reporter.completed_datasets()
+    skip_tables   = reporter.completed_tables()
+    if skip_datasets or skip_tables:
+        log.info(
+            "Resume state: %d completed dataset(s), %d already-processed table(s)",
+            len(skip_datasets), len(skip_tables),
+        )
 
     try:
         with BrowserManager(
@@ -166,7 +197,12 @@ def run() -> None:
                 log.info("Dataset %d/%d: %s", ds_idx + 1, len(datasets), ds_name)
                 log.info("━" * 70)
 
+                if ds_name in skip_datasets:
+                    log.info("✓ Already fully processed in prior run — skipping")
+                    continue
+
                 downloaded: list[Path] = []  # cleaned up after this dataset
+                dataset_finished_cleanly = False
 
                 try:
                     # Navigate back to catalogue if needed
@@ -193,6 +229,11 @@ def run() -> None:
                         dataset_url = bm.page.url  # remember for recovery
 
                         for row_idx, row_meta in enumerate(rows):
+                            table_no = row_meta.get("table_no", str(row_idx + 1))
+                            if (ds_name, table_no) in skip_tables:
+                                log.info("    ▶ [%s] — already processed, skipping", table_no)
+                                continue
+
                             excel_path = _process_row(
                                 bm, dp, row_idx, row_meta,
                                 dataset_url, reporter, ds_name, log,
@@ -205,12 +246,21 @@ def run() -> None:
                             except Exception:
                                 pass
 
+                        # Checkpoint at page boundaries (≤10 tables of work
+                        # at risk on crash). Cheap enough; pages have at most
+                        # ~10 tables, so this is roughly 10× less frequent
+                        # than per-table saves.
+                        reporter.save()
+
                         if dp.has_next_page():
                             dp.go_to_next_page()
                             dp.wait_for_table()
                             ds_page_num += 1
                         else:
                             break
+
+                    # Reached only if the while-loop exited cleanly (all pages done)
+                    dataset_finished_cleanly = True
 
                 except Exception as exc:
                     log.error("Error processing dataset '%s': %s", ds_name, exc, exc_info=True)
@@ -236,6 +286,11 @@ def run() -> None:
                     if downloaded:
                         log.info("Cleaned up %d/%d Excel file(s) for dataset", removed, len(downloaded))
 
+                    if dataset_finished_cleanly:
+                        reporter.mark_dataset_complete(ds_name)
+                        log.info("✓ Dataset complete: %s", ds_name)
+                    reporter.save()
+
     except Exception as exc:
         log.critical("Fatal error: %s", exc, exc_info=True)
 
@@ -245,4 +300,10 @@ def run() -> None:
 
 
 if __name__ == "__main__":
-    run()
+    parser = argparse.ArgumentParser(description="MoSPI Data Catalogue Automation")
+    parser.add_argument(
+        "--continue", dest="continue_run", action="store_true",
+        help="Resume the most recent report, skipping completed datasets/tables.",
+    )
+    args = parser.parse_args()
+    run(continue_run=args.continue_run)

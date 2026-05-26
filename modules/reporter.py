@@ -1,13 +1,13 @@
 import logging
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional, Set, Tuple
 
 import openpyxl
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
-from .comparator import ComparisonResult
+from .comparator import ComparisonResult, Mismatch
 
 log = logging.getLogger(__name__)
 
@@ -37,10 +37,30 @@ def _auto_width(ws) -> None:
 
 
 class Reporter:
-    """Accumulates per-table results and writes a final .xlsx comparison report."""
+    """
+    Accumulates per-table results and writes a checkpointable .xlsx report.
 
-    def __init__(self) -> None:
+    Pass `report_path` at construction time to enable incremental saves and
+    resume-from-disk. If the file already exists, prior entries and the set
+    of fully-completed datasets are loaded so a follow-up run can pick up
+    where the previous one left off.
+    """
+
+    def __init__(self, report_path: Optional[Path] = None) -> None:
         self._entries: List[Dict] = []
+        self._completed_datasets: Set[str] = set()
+        self.report_path: Optional[Path] = report_path
+        if report_path and report_path.exists():
+            try:
+                self._load_existing(report_path)
+                log.info(
+                    "Loaded %d prior entries and %d completed dataset(s) from %s",
+                    len(self._entries), len(self._completed_datasets), report_path,
+                )
+            except Exception as exc:
+                log.warning("Could not load %s — starting fresh: %s", report_path, exc)
+                self._entries = []
+                self._completed_datasets = set()
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -55,22 +75,124 @@ class Reporter:
         }
         self._entries.append({"dataset": dataset, "meta": empty_meta, "result": r})
 
-    def generate(self, report_dir: Path = Path("reports")) -> Path:
-        report_dir.mkdir(parents=True, exist_ok=True)
-        ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
-        path = report_dir / f"comparison_report_{ts}.xlsx"
+    def mark_dataset_complete(self, dataset_name: str) -> None:
+        """Flag a dataset as fully processed (all pages iterated)."""
+        self._completed_datasets.add(dataset_name)
+
+    def completed_datasets(self) -> Set[str]:
+        return set(self._completed_datasets)
+
+    def completed_tables(self) -> Set[Tuple[str, str]]:
+        """(dataset_name, table_no) pairs already in the report."""
+        return {(e["dataset"], e["meta"].get("table_no", "")) for e in self._entries}
+
+    def save(self) -> Optional[Path]:
+        """Write the current state to `self.report_path` (overwriting)."""
+        if not self.report_path:
+            return None
+        self.report_path.parent.mkdir(parents=True, exist_ok=True)
 
         wb = openpyxl.Workbook()
         self._write_summary(wb)
         self._write_mismatches(wb)
+        self._write_completed(wb)
 
         if "Sheet" in wb.sheetnames:
             del wb["Sheet"]
 
-        wb.save(path)
-        log.info("Report saved: %s", path)
-        print(f"\n✓ Report saved → {path}")
-        return path
+        try:
+            wb.save(self.report_path)
+        except PermissionError:
+            log.warning(
+                "Could not save %s (file open in Excel?); will retry on next save",
+                self.report_path,
+            )
+            return None
+        return self.report_path
+
+    def generate(self, report_dir: Path = Path("reports")) -> Path:
+        """Back-compat: pick a path if not set, then save."""
+        if not self.report_path:
+            report_dir.mkdir(parents=True, exist_ok=True)
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            self.report_path = report_dir / f"comparison_report_{ts}.xlsx"
+        path = self.save()
+        if path:
+            log.info("Report saved: %s", path)
+            print(f"\n✓ Report saved → {path}")
+        return self.report_path
+
+    # ── Reload from disk ──────────────────────────────────────────────────────
+
+    def _load_existing(self, path: Path) -> None:
+        wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+
+        # Summary → reconstruct entry stubs keyed by (dataset, table_no).
+        idx: Dict[Tuple[str, str], Dict] = {}
+        if "Summary" in wb.sheetnames:
+            ws = wb["Summary"]
+            for row in ws.iter_rows(min_row=2, values_only=True):
+                if not row or not row[0]:
+                    continue
+                (dataset, table_no, table_name, product, category,
+                 release_date, status, total_rows, _mm_count, notes) = (
+                    list(row[:10]) + [None] * (10 - len(row[:10]))
+                )
+                meta = {
+                    "table_no":     str(table_no or ""),
+                    "table_name":   str(table_name or ""),
+                    "product":      str(product or ""),
+                    "category":     str(category or ""),
+                    "release_date": str(release_date or ""),
+                }
+                result = ComparisonResult(
+                    status=str(status or "PASS"),
+                    total_rows=int(total_rows or 0),
+                )
+                entry = {
+                    "dataset": str(dataset),
+                    "meta":    meta,
+                    "result":  result,
+                    "_raw_notes": notes or "",   # preserve notes verbatim
+                }
+                self._entries.append(entry)
+                idx[(entry["dataset"], meta["table_no"])] = entry
+
+        # Mismatches → attach to their parent entry.
+        if "Mismatches" in wb.sheetnames:
+            ws = wb["Mismatches"]
+            for row in ws.iter_rows(min_row=2, values_only=True):
+                if not row or not row[0]:
+                    continue
+                (dataset, table_no, _table_name, excel_cell, row_num,
+                 row_label, column, excel_value, web_value) = (
+                    list(row[:9]) + [None] * (9 - len(row[:9]))
+                )
+                key = (str(dataset), str(table_no or ""))
+                entry = idx.get(key)
+                if entry is None:
+                    continue
+                try:
+                    row_int = int(row_num or 0)
+                except (TypeError, ValueError):
+                    row_int = 0
+                entry["result"].mismatches.append(Mismatch(
+                    row=row_int,
+                    column=str(column or ""),
+                    excel_value=str(excel_value or ""),
+                    web_value=str(web_value or ""),
+                    excel_cell=str(excel_cell or ""),
+                    row_label=str(row_label or ""),
+                ))
+
+        # Completed datasets sheet.
+        if "Completed" in wb.sheetnames:
+            ws = wb["Completed"]
+            for row in ws.iter_rows(min_row=2, values_only=True):
+                if row and row[0]:
+                    self._completed_datasets.add(str(row[0]))
+
+        wb.close()
 
     # ── Sheet builders ────────────────────────────────────────────────────────
 
@@ -112,19 +234,25 @@ class Reporter:
             ws.cell(ri, 8,  res.total_rows)
             ws.cell(ri, 9,  res.mismatch_count)
 
-            notes: List[str] = []
-            if res.error:
-                notes.append(f"Error: {res.error}")
-            if res.col_mismatch:
-                if res.missing_cols:
-                    notes.append(f"Missing cols (Excel only): {', '.join(res.missing_cols)}")
-                if res.extra_cols:
-                    notes.append(f"Extra cols (Web only): {', '.join(res.extra_cols)}")
-            if res.excel_extra_rows:
-                notes.append(f"Excel has {res.excel_extra_rows} extra row(s)")
-            if res.web_extra_rows:
-                notes.append(f"Web has {res.web_extra_rows} extra row(s)")
-            ws.cell(ri, 10, "; ".join(notes))
+            # Reloaded entries keep their original notes verbatim; freshly
+            # computed entries derive notes from the live ComparisonResult.
+            raw_notes = entry.get("_raw_notes")
+            if raw_notes:
+                ws.cell(ri, 10, str(raw_notes))
+            else:
+                notes: List[str] = []
+                if res.error:
+                    notes.append(f"Error: {res.error}")
+                if res.col_mismatch:
+                    if res.missing_cols:
+                        notes.append(f"Missing cols (Excel only): {', '.join(res.missing_cols)}")
+                    if res.extra_cols:
+                        notes.append(f"Extra cols (Web only): {', '.join(res.extra_cols)}")
+                if res.excel_extra_rows:
+                    notes.append(f"Excel has {res.excel_extra_rows} extra row(s)")
+                if res.web_extra_rows:
+                    notes.append(f"Web has {res.web_extra_rows} extra row(s)")
+                ws.cell(ri, 10, "; ".join(notes))
 
             if ri % 2 == 0:
                 for ci in [1, 2, 3, 4, 5, 6, 8, 9, 10]:
@@ -177,3 +305,15 @@ class Reporter:
 
         _auto_width(ws)
         ws.row_dimensions[1].height = 30
+
+    def _write_completed(self, wb: openpyxl.Workbook) -> None:
+        """
+        Sheet listing datasets whose every page has been iterated end-to-end.
+        On `--continue`, datasets in this list are skipped wholesale by main.
+        """
+        ws = wb.create_sheet("Completed")
+        _hdr(ws.cell(row=1, column=1, value="Dataset"))
+        for ri, name in enumerate(sorted(self._completed_datasets), 2):
+            ws.cell(ri, 1, name)
+        _auto_width(ws)
+        ws.row_dimensions[1].height = 24

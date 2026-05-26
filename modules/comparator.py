@@ -12,6 +12,20 @@ def _norm(val) -> str:
     return "" if val is None else str(val).strip()
 
 
+def _looks_like_header_row(row: List[str]) -> bool:
+    """True if a row's non-empty cells are mostly non-numeric (labels, months, etc.)."""
+    non_empty = [v for v in row if v]
+    if not non_empty:
+        return False
+    non_numeric = 0
+    for v in non_empty:
+        try:
+            float(v.replace(",", "").replace("%", ""))
+        except (ValueError, AttributeError):
+            non_numeric += 1
+    return non_numeric / len(non_empty) > 0.5
+
+
 def _values_equal(a: str, b: str) -> bool:
     """
     True if two cell values represent the same content.
@@ -120,6 +134,44 @@ def compare(excel_data: Optional[Dict], web_data: Optional[Dict]) -> ComparisonR
 
     excel_hdrs, excel_rows = _trim_trailing_empty_cols(excel_hdrs, excel_rows)
     web_hdrs,   web_rows   = _trim_trailing_empty_cols(web_hdrs,   web_rows)
+
+    # ── Sub-header sanity check ──────────────────────────────────────────────
+    # MoSPI tables often have a sub-header row right under the main header
+    # (e.g. "July 24 Index | July 25 Index | Inflation" for the Cereals
+    # row of the YoY table). When the Datawrapper CSV behind the iframe
+    # is a stale version, that sub-header reads "June 24 / June 25" while
+    # the downloaded Excel says "July 24 / July 25" — every data row then
+    # appears mismatched because the time periods differ. Catch this and
+    # surface a single clear error instead of hundreds of false cell rows.
+    if excel_rows and web_rows:
+        r0_e = excel_rows[0]
+        r0_w = web_rows[0]
+        min_len = min(len(r0_e), len(r0_w))
+        if (
+            min_len >= 4
+            and _looks_like_header_row(r0_e)
+            and _looks_like_header_row(r0_w)
+        ):
+            diffs = sum(
+                1 for i in range(min_len)
+                if not _values_equal(r0_e[i], r0_w[i])
+            )
+            if diffs >= 2 and diffs / min_len >= 0.25:
+                log.warning(
+                    "Sub-header row differs in %d/%d cells — skipping per-cell "
+                    "comparison. Excel head: %s | Web head: %s",
+                    diffs, min_len, r0_e[:6], r0_w[:6],
+                )
+                result.status = "ERROR"
+                result.error = (
+                    f"Sub-header content differs ({diffs}/{min_len} cells) — "
+                    f"likely a time-period or table-version mismatch between "
+                    f"the downloaded Excel and the web table. "
+                    f"Excel row 0 starts: {r0_e[:6]}; Web row 0 starts: {r0_w[:6]}"
+                )
+                result.total_rows = max(len(excel_rows), len(web_rows))
+                result.total_cols = max(len(excel_hdrs), len(web_hdrs))
+                return result
 
     # ── Column comparison ────────────────────────────────────────────────────
     if excel_hdrs != web_hdrs:
