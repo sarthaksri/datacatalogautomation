@@ -6,12 +6,16 @@ Navigates every dataset on the catalogue page, iterates all table rows
 and produces a cell-level comparison report.
 
 Usage:
-    python main.py             # fresh run
+    python main.py             # fresh run, every dataset
     python main.py --continue  # resume the most recent report
+    python main.py --IIP       # only datasets whose name contains "IIP"
+    python main.py --only CPI  # same idea, long form
+    python main.py --from CPI  # CPI and every dataset listed after it
 """
 
 import argparse
 import logging
+import re
 import sys
 import time
 from datetime import datetime
@@ -143,7 +147,12 @@ def _pick_report_path(continue_run: bool, log: logging.Logger) -> Path:
     return config.REPORT_DIR / f"comparison_report_{ts}.xlsx"
 
 
-def run(continue_run: bool = False, rerun_datasets: Optional[List[str]] = None) -> None:
+def run(
+    continue_run: bool = False,
+    rerun_datasets: Optional[List[str]] = None,
+    only: Optional[str] = None,
+    start_from: Optional[str] = None,
+) -> None:
     for d in [config.DOWNLOAD_DIR, config.REPORT_DIR, config.LOG_DIR, config.SCREENSHOT_DIR]:
         d.mkdir(parents=True, exist_ok=True)
 
@@ -199,6 +208,40 @@ def run(continue_run: bool = False, rerun_datasets: Optional[List[str]] = None) 
 
             log.info("Found %d dataset(s) on catalogue page", len(datasets))
 
+            if only:
+                needle = only.lower()
+                filtered = [d for d in datasets if needle in d["name"].lower()]
+                if not filtered:
+                    log.error(
+                        "--only %r matched no datasets. Available: %s",
+                        only, [d["name"] for d in datasets],
+                    )
+                    return
+                log.info(
+                    "Filter --only %r matched %d/%d dataset(s): %s",
+                    only, len(filtered), len(datasets), [d["name"] for d in filtered],
+                )
+                datasets = filtered
+
+            if start_from:
+                needle = start_from.lower()
+                start_idx = next(
+                    (i for i, d in enumerate(datasets) if needle in d["name"].lower()),
+                    None,
+                )
+                if start_idx is None:
+                    log.error(
+                        "--from %r matched no datasets. Available: %s",
+                        start_from, [d["name"] for d in datasets],
+                    )
+                    return
+                tail = datasets[start_idx:]
+                log.info(
+                    "Filter --from %r matched at position %d — running %d dataset(s): %s",
+                    start_from, start_idx, len(tail), [d["name"] for d in tail],
+                )
+                datasets = tail
+
             # ── Iterate datasets ──────────────────────────────────────────
             for ds_idx, ds_info in enumerate(datasets):
                 ds_name = ds_info["name"]
@@ -219,7 +262,7 @@ def run(continue_run: bool = False, rerun_datasets: Optional[List[str]] = None) 
                     if config.CATALOGUE_URL not in bm.page.url:
                         catalogue.reload()
 
-                    catalogue.click_dataset_by_index(ds_idx)
+                    catalogue.click_dataset_by_index(ds_info["index"])
 
                     dp = _make_dataset_page(bm.page, config.DOWNLOAD_DIR)
                     dp.wait_for_table()
@@ -228,13 +271,26 @@ def run(continue_run: bool = False, rerun_datasets: Optional[List[str]] = None) 
                     log.info("  Pages of tables: %d", total_pages)
 
                     ds_page_num = 1
+                    pagination_broke = False
                     while True:
                         log.info("  — Dataset page %d/%d —", ds_page_num, total_pages)
 
                         rows = dp.get_rows()
                         if not rows:
-                            log.warning("  No rows found, skipping page")
-                            break
+                            log.warning(
+                                "  No rows on page %d (of %d expected) — "
+                                "pagination likely failed mid-rerender; will retry once",
+                                ds_page_num, total_pages,
+                            )
+                            time.sleep(2)
+                            rows = dp.get_rows()
+                            if not rows:
+                                log.error(
+                                    "  Still no rows after retry — stopping; "
+                                    "dataset will NOT be marked complete so --continue can resume."
+                                )
+                                pagination_broke = True
+                                break
 
                         dataset_url = bm.page.url  # remember for recovery
 
@@ -263,14 +319,32 @@ def run(continue_run: bool = False, rerun_datasets: Optional[List[str]] = None) 
                         reporter.save()
 
                         if dp.has_next_page():
-                            dp.go_to_next_page()
-                            dp.wait_for_table()
+                            if not dp.go_to_next_page():
+                                log.error(
+                                    "  go_to_next_page() failed at page %d/%d — "
+                                    "stopping; dataset will NOT be marked complete.",
+                                    ds_page_num, total_pages,
+                                )
+                                pagination_broke = True
+                                break
                             ds_page_num += 1
                         else:
                             break
 
-                    # Reached only if the while-loop exited cleanly (all pages done)
-                    dataset_finished_cleanly = True
+                    # Only mark complete if we actually visited every expected page.
+                    # Catches the case where MUI silently leaves us on the same
+                    # page or has_next_page() flakes early.
+                    if pagination_broke:
+                        dataset_finished_cleanly = False
+                    elif ds_page_num < total_pages:
+                        log.error(
+                            "  Stopped at page %d but expected %d — NOT marking "
+                            "dataset complete so --continue can resume.",
+                            ds_page_num, total_pages,
+                        )
+                        dataset_finished_cleanly = False
+                    else:
+                        dataset_finished_cleanly = True
 
                 except Exception as exc:
                     log.error("Error processing dataset '%s': %s", ds_name, exc, exc_info=True)
@@ -309,6 +383,29 @@ def run(continue_run: bool = False, rerun_datasets: Optional[List[str]] = None) 
         log.info("Automation complete.")
 
 
+_KNOWN_FLAGS = {"--continue", "--rerun", "--only", "--from", "-h", "--help"}
+
+
+def _normalize_argv(argv: List[str]) -> List[str]:
+    """Translate shorthand flags like --IIP, --CPI, --PLFS to --only IIP.
+
+    Anything matching --<alnum> that isn't a known flag and isn't followed
+    by '=' is rewritten. Leaves --only/--rerun/--continue alone.
+    """
+    out: List[str] = []
+    for a in argv:
+        if (
+            a.startswith("--")
+            and "=" not in a
+            and a not in _KNOWN_FLAGS
+            and re.fullmatch(r"--[A-Za-z][A-Za-z0-9_-]*", a)
+        ):
+            out.extend(["--only", a[2:]])
+        else:
+            out.append(a)
+    return out
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="MoSPI Data Catalogue Automation")
     parser.add_argument(
@@ -323,5 +420,23 @@ if __name__ == "__main__":
              'Examples: --rerun "INDEX OF INDUSTRIAL PRODUCTION IIP" '
              '--rerun "CONSUMER PRICE INDEX CPI". Use with --continue.',
     )
-    args = parser.parse_args()
-    run(continue_run=args.continue_run, rerun_datasets=args.rerun_datasets)
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        "--only", dest="only", default=None, metavar="SUBSTRING",
+        help='Run only datasets whose name contains SUBSTRING '
+             '(case-insensitive). Shorthand: --IIP / --CPI / --PLFS etc. '
+             'all map to --only <name>.',
+    )
+    group.add_argument(
+        "--from", dest="start_from", default=None, metavar="SUBSTRING",
+        help='Start at the first dataset whose name contains SUBSTRING '
+             '(case-insensitive) and run it plus every dataset after it. '
+             'Example: --from CPI runs CPI and all datasets listed after CPI.',
+    )
+    args = parser.parse_args(_normalize_argv(sys.argv[1:]))
+    run(
+        continue_run=args.continue_run,
+        rerun_datasets=args.rerun_datasets,
+        only=args.only,
+        start_from=args.start_from,
+    )

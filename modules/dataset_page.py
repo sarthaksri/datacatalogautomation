@@ -102,20 +102,54 @@ class DatasetPage:
         return not self._is_disabled(self.page.locator(self.NEXT_PAGE_BTN))
 
     def go_to_next_page(self) -> bool:
+        """Click Next and wait for MUI to actually advance the page.
+
+        The previous version waited on `networkidle` + a fixed 1s sleep,
+        which often returned while React was still mid-rerender. The next
+        iteration's get_rows() then read either stale cards or zero cards,
+        and the outer loop bailed out thinking the dataset was finished.
+
+        Now we capture the pagination text ("1–10 of 436") BEFORE clicking
+        and poll until it changes — that's the only reliable signal that
+        MUI has finished swapping the page.
+        """
         if not self.has_next_page():
             log.info("No next page — at end of listing")
             return False
+
+        before_text = self._pagination_text()
         try:
             self.page.locator(self.NEXT_PAGE_BTN).first.click()
-            self.page.wait_for_load_state("networkidle")
-            # MUI re-renders cards; give the DOM a moment to settle
-            time.sleep(1)
-            self.wait_for_cards()
-            log.info("Navigated to next listing page")
-            return True
         except Exception as e:
             log.warning("Next-page click failed: %s", e)
             return False
+
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            after_text = self._pagination_text()
+            if after_text and after_text != before_text:
+                break
+            time.sleep(0.25)
+        else:
+            log.warning(
+                "Pagination text did not change after Next click "
+                "(stayed at %r) — page advance failed",
+                before_text,
+            )
+            return False
+
+        try:
+            self.page.wait_for_load_state("networkidle", timeout=10_000)
+        except Exception:
+            pass
+        try:
+            self.wait_for_cards()
+        except Exception as e:
+            log.warning("Cards not present after Next: %s", e)
+            return False
+
+        log.info("Navigated to next listing page: %s", after_text)
+        return True
 
     # ── Rows / metadata ───────────────────────────────────────────────────────
 

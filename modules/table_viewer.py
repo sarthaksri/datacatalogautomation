@@ -9,6 +9,8 @@ from typing import Dict, List, Optional, Tuple
 import pandas as pd
 from playwright.sync_api import Page
 
+from modules.header_detect import pick_header_idx
+
 log = logging.getLogger(__name__)
 
 
@@ -178,8 +180,9 @@ class TableViewer:
         """Parse CSV/TSV text into {'headers': [...], 'rows': [[...], ...]}.
 
         Datawrapper CSVs typically have a leading metadata row (the chart
-        title / caption) before the real header. We treat the first row that
-        contains > 1 non-empty cell as the header.
+        title) before the real header, and for NAS-style tables a sparse
+        sub-title row above the column header. The shared header picker in
+        modules.header_detect handles both shapes.
         """
         try:
             # Read with no header so we can pick the right one ourselves.
@@ -195,15 +198,11 @@ class TableViewer:
         for col in df.columns:
             df[col] = df[col].str.strip()
 
-        header_idx = 0
-        for i in range(len(df)):
-            non_empty = sum(1 for v in df.iloc[i] if v)
-            if non_empty > 1:
-                header_idx = i
-                break
+        all_rows = [list(r) for r in df.values.tolist()]
+        header_idx = pick_header_idx(all_rows)
 
-        headers = [str(c).strip() for c in df.iloc[header_idx].tolist()]
-        rows = [list(r) for r in df.iloc[header_idx + 1:].values.tolist()]
+        headers = list(all_rows[header_idx]) if all_rows else []
+        rows = all_rows[header_idx + 1:]
         # Drop trailing all-empty rows
         while rows and not any(c for c in rows[-1]):
             rows.pop()

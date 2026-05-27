@@ -4,6 +4,8 @@ from typing import Dict, List, Optional
 
 import pandas as pd
 
+from modules.header_detect import pick_header_idx
+
 log = logging.getLogger(__name__)
 
 
@@ -16,10 +18,12 @@ class ExcelHandler:
         Returns {"headers": [...], "rows": [[...], ...]} or None on error.
         All values are returned as stripped strings.
 
-        MoSPI Excel files begin with a title row plus a blank row before the
-        real header. We read with no header and pick the first row with more
-        than one non-empty cell — the same heuristic the web-side CSV parser
-        uses, so Excel and web align row-for-row.
+        MoSPI Excel files often have a multi-row header: a sparse "sub-title"
+        row (e.g. just "At Current Prices" / "At Constant Prices" in two cells)
+        sitting above the real column header (Sl.No., Industry, year columns).
+        We pick the header by finding the first numeric data row, then walking
+        back to the nearest row whose fill ratio matches the data — see
+        modules.header_detect.pick_header_idx for the algorithm.
         """
         if not file_path or not file_path.exists():
             log.error("Excel file not found: %s", file_path)
@@ -43,15 +47,11 @@ class ExcelHandler:
         for col in df.columns:
             df[col] = df[col].str.strip()
 
-        header_idx = 0
-        for i in range(len(df)):
-            non_empty = sum(1 for v in df.iloc[i] if v)
-            if non_empty > 1:
-                header_idx = i
-                break
+        all_rows: List[List[str]] = [list(r) for r in df.values.tolist()]
+        header_idx = pick_header_idx(all_rows)
 
-        headers: List[str] = [str(c).strip() for c in df.iloc[header_idx].tolist()]
-        rows: List[List[str]] = [list(r) for r in df.iloc[header_idx + 1:].values.tolist()]
+        headers: List[str] = list(all_rows[header_idx]) if all_rows else []
+        rows: List[List[str]] = all_rows[header_idx + 1:]
         while rows and not any(c for c in rows[-1]):
             rows.pop()
 
