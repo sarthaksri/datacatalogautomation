@@ -196,11 +196,34 @@ class DatasetPage:
 
     # ── Actions ──────────────────────────────────────────────────────────────
 
+    # Real spreadsheets start with one of these magic byte sequences:
+    #   PK\x03\x04  — zip container (.xlsx / .xlsm)
+    #   \xD0\xCF\x11\xE0 — OLE2 compound file (.xls)
+    # The MoSPI SPA sometimes hands back its index.html shell (starts with
+    # '<') instead of the file, which lands on disk as a tiny HTML doc and
+    # then fails to parse as "Excel file could not be read".
+    _XLSX_MAGIC = b"PK\x03\x04"
+    _XLS_MAGIC  = b"\xD0\xCF\x11\xE0"
+
+    @classmethod
+    def _looks_like_excel(cls, path: Path) -> bool:
+        try:
+            with open(path, "rb") as fh:
+                head = fh.read(8)
+        except OSError:
+            return False
+        return head.startswith(cls._XLSX_MAGIC) or head.startswith(cls._XLS_MAGIC)
+
     def download_excel(self, row_index: int, table_name: str, table_no: str) -> Optional[Path]:
         """
         Click the download link and wait for the file to land on disk.
         Uses Playwright's expect_download — the `download` attribute on the
         <a> prevents navigation, so the page stays put.
+
+        The download is occasionally the SPA's HTML shell rather than the
+        real spreadsheet (a known MoSPI flake). We validate the saved file's
+        magic bytes and retry a few times before giving up, so a single bad
+        download no longer turns into an "Excel file could not be read" error.
 
         After the download completes we re-wait for the cards before
         returning, so the caller can safely interact with View Table next.
@@ -210,40 +233,57 @@ class DatasetPage:
                 .replace(" ", "_").replace(":", "_").replace("?", ""))
         dest = self.download_dir / f"{safe}.xlsx"
 
-        card = self.page.locator(self.CARD_SEL).nth(row_index)
-        link = card.locator(self.DOWNLOAD_SEL).first
+        attempts = 3
+        for attempt in range(1, attempts + 1):
+            card = self.page.locator(self.CARD_SEL).nth(row_index)
+            link = card.locator(self.DOWNLOAD_SEL).first
 
-        if link.count() == 0:
-            log.error("No download link on card %d", row_index)
-            return None
+            if link.count() == 0:
+                log.error("No download link on card %d", row_index)
+                return None
 
-        try:
-            log.info("Downloading Excel for [%s] %s", table_no, table_name)
             try:
-                link.scroll_into_view_if_needed(timeout=5_000)
-            except Exception:
-                pass
+                log.info("Downloading Excel for [%s] %s (attempt %d/%d)",
+                         table_no, table_name, attempt, attempts)
+                try:
+                    link.scroll_into_view_if_needed(timeout=5_000)
+                except Exception:
+                    pass
 
-            with self.page.expect_download(timeout=90_000) as dl_info:
-                link.click(timeout=15_000)
-            download: Download = dl_info.value
-            download.save_as(str(dest))
-            log.info("Saved to: %s", dest)
+                with self.page.expect_download(timeout=90_000) as dl_info:
+                    link.click(timeout=15_000)
+                download: Download = dl_info.value
+                download.save_as(str(dest))
 
-            # Give the page a moment to settle (React/MUI re-render after click)
-            try:
-                self.wait_for_cards()
-            except Exception:
-                pass
-            return dest
-        except Exception as e:
-            log.error("Download failed for card %d: %s", row_index, e)
-            # Even on failure, try to leave the page in a usable state
-            try:
-                self.wait_for_cards()
-            except Exception:
-                pass
-            return None
+                # Give the page a moment to settle (React/MUI re-render after click)
+                try:
+                    self.wait_for_cards()
+                except Exception:
+                    pass
+
+                if self._looks_like_excel(dest):
+                    log.info("Saved to: %s", dest)
+                    return dest
+
+                size = dest.stat().st_size if dest.exists() else 0
+                log.warning(
+                    "Download for [%s] is not a valid spreadsheet (%d bytes, "
+                    "likely the HTML shell) — retrying",
+                    table_no, size,
+                )
+                time.sleep(1.5)
+            except Exception as e:
+                log.error("Download attempt %d failed for card %d: %s",
+                          attempt, row_index, e)
+                try:
+                    self.wait_for_cards()
+                except Exception:
+                    pass
+                time.sleep(1.0)
+
+        log.error("All %d download attempts for [%s] produced a non-Excel file",
+                  attempts, table_no)
+        return dest if dest.exists() else None
 
     def click_view_table(self, row_index: int) -> Optional[Page]:
         """

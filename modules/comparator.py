@@ -181,6 +181,70 @@ def _trim_trailing_empty_cols(
     return hdrs[:n], [r[:n] for r in rows]
 
 
+_YEAR_RANGE_RE = re.compile(r"^(\d{4})\s*[-–/]\s*(\d{2,4})$")
+
+
+def _canon_key(s: str) -> str:
+    """Canonicalise a row-key cell for matching.
+
+    Fiscal-year ranges are written inconsistently across MoSPI tables and
+    even within one ('1999-2000', '2003-04', '2003-2004'). The start year
+    identifies the range uniquely, so collapse any 'YYYY-YY'/'YYYY-YYYY' to
+    just the start year. Everything else is lower-cased and stripped.
+    """
+    s = s.strip()
+    m = _YEAR_RANGE_RE.match(s)
+    if m:
+        return m.group(1)
+    return s.lower()
+
+
+def _drop_empty_rows(rows: List[List[str]]) -> List[List[str]]:
+    return [r for r in rows if any(c for c in r)]
+
+
+def _key_align(
+    excel_rows: List[List[str]], web_rows: List[List[str]],
+    ekey: int, wkey: int,
+) -> Optional[List[Tuple[Optional[int], Optional[int]]]]:
+    """Align rows by their first-column key instead of by position.
+
+    Returns a list of (excel_idx | None, web_idx | None) pairs, or None when
+    the first column isn't a reliable key on both sides (then the caller
+    falls back to positional comparison). A clean key column turns "web is
+    missing one row in the middle" into a single extra-row finding rather
+    than a cascade of off-by-one cell mismatches.
+    """
+    e_keys = [_canon_key(r[ekey]) if ekey < len(r) else "" for r in excel_rows]
+    w_keys = [_canon_key(r[wkey]) if wkey < len(r) else "" for r in web_rows]
+
+    def good(keys: List[str]) -> bool:
+        non_empty = [k for k in keys if k]
+        return (
+            len(keys) >= 3
+            and len(non_empty) >= 0.9 * len(keys)
+            and len(set(non_empty)) == len(non_empty)   # unique
+        )
+
+    if not (good(e_keys) and good(w_keys)):
+        return None
+
+    w_index = {k: j for j, k in enumerate(w_keys) if k}
+    used_w = set()
+    pairs: List[Tuple[Optional[int], Optional[int]]] = []
+    for i, k in enumerate(e_keys):
+        if k and k in w_index:
+            j = w_index[k]
+            pairs.append((i, j))
+            used_w.add(j)
+        else:
+            pairs.append((i, None))   # row only in Excel
+    for j, k in enumerate(w_keys):
+        if j not in used_w:
+            pairs.append((None, j))   # row only on web
+    return pairs
+
+
 @dataclass
 class Mismatch:
     row: int          # 1-indexed data row number
@@ -290,15 +354,14 @@ def compare(excel_data: Optional[Dict], web_data: Optional[Dict]) -> ComparisonR
         result.missing_cols = [h for h in ex_named if not any(_values_equal(h, w) for w in wb_named)]
         result.extra_cols   = [h for h in wb_named if not any(_values_equal(h, e) for e in ex_named)]
 
+    # Drop fully-empty rows on both sides (Datawrapper pads with blank rows;
+    # Excel exports sometimes carry blank spacer rows) so they don't skew the
+    # row-count diff or the key-uniqueness check below.
+    excel_rows = _drop_empty_rows(excel_rows)
+    web_rows   = _drop_empty_rows(web_rows)
+
     result.total_rows = max(len(excel_rows), len(web_rows))
     result.total_cols = max(len(excel_hdrs), len(web_hdrs))
-
-    if len(excel_rows) > len(web_rows):
-        result.excel_extra_rows = len(excel_rows) - len(web_rows)
-        log.warning("Excel has %d extra rows vs web table", result.excel_extra_rows)
-    elif len(web_rows) > len(excel_rows):
-        result.web_extra_rows = len(web_rows) - len(excel_rows)
-        log.warning("Web table has %d extra rows vs Excel", result.web_extra_rows)
 
     # ── Pick column mapping ──────────────────────────────────────────────────
     # When col counts match, compare positionally — merged-cell headers leave
@@ -318,13 +381,39 @@ def compare(excel_data: Optional[Dict], web_data: Optional[Dict]) -> ComparisonR
         exc_indices = [excel_hdrs.index(h) for h in shared]
         web_indices = [web_hdrs.index(h)   for h in shared]
 
-    # ── Cell-by-cell comparison ──────────────────────────────────────────────
-    min_rows = min(len(excel_rows), len(web_rows))
-    for row_i in range(min_rows):
-        er = excel_rows[row_i]
-        wr = web_rows[row_i]
+    # ── Row alignment ─────────────────────────────────────────────────────────
+    # Prefer matching rows by their first-column key (year, state, item…) so a
+    # single missing/extra row in the middle is reported once, not as an
+    # off-by-one cascade of false cell mismatches. Fall back to positional
+    # pairing when the first column isn't a clean key on both sides.
+    ekey = exc_indices[0] if exc_indices else 0
+    wkey = web_indices[0] if web_indices else 0
+    aligned = _key_align(excel_rows, web_rows, ekey, wkey)
+
+    if aligned is None:
+        min_rows = min(len(excel_rows), len(web_rows))
+        aligned = [(i, i) for i in range(min_rows)]
+        if len(excel_rows) > len(web_rows):
+            result.excel_extra_rows = len(excel_rows) - len(web_rows)
+        elif len(web_rows) > len(excel_rows):
+            result.web_extra_rows = len(web_rows) - len(excel_rows)
+    else:
+        result.excel_extra_rows = sum(1 for e, w in aligned if w is None)
+        result.web_extra_rows   = sum(1 for e, w in aligned if e is None)
+
+    if result.excel_extra_rows:
+        log.warning("Excel has %d row(s) with no web match", result.excel_extra_rows)
+    if result.web_extra_rows:
+        log.warning("Web table has %d row(s) with no Excel match", result.web_extra_rows)
+
+    # ── Cell-by-cell comparison over aligned pairs ────────────────────────────
+    for ei, wj in aligned:
+        if ei is None or wj is None:
+            continue  # unmatched row — counted as extra above, no cell diffs
+        er = excel_rows[ei]
+        wr = web_rows[wj]
         # Excel rows are 1-indexed; data row 0 sits at header_row_idx + 2.
-        excel_row_num = header_row_idx + 2 + row_i
+        excel_row_num = header_row_idx + 2 + ei
         for j, col_name in enumerate(col_labels):
             exc_idx = exc_indices[j]
             ev = er[exc_idx]         if exc_idx        < len(er) else ""
@@ -334,7 +423,7 @@ def compare(excel_data: Optional[Dict], web_data: Optional[Dict]) -> ComparisonR
                 label    = _row_label(er, exc_idx)
                 result.mismatches.append(
                     Mismatch(
-                        row=row_i + 1,
+                        row=ei + 1,
                         column=col_name,
                         excel_value=ev,
                         web_value=wv,

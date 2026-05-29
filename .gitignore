@@ -3,3 +3,8 @@ __pycache__
 downloads
 logs
 screenshots
+
+# Generated workbooks / reports and diagnostic artifacts
+*.xlsx
+scripts/diag_*.txt
+scripts/diag_downloads/
