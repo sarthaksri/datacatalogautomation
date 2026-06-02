@@ -1,3 +1,4 @@
+import csv
 import json
 import logging
 import re
@@ -179,29 +180,39 @@ class TableViewer:
     def _parse_csv(text: str) -> Dict:
         """Parse CSV/TSV text into {'headers': [...], 'rows': [[...], ...]}.
 
-        Datawrapper CSVs typically have a leading metadata row (the chart
-        title) before the real header, and for NAS-style tables a sparse
-        sub-title row above the column header. The shared header picker in
-        modules.header_detect handles both shapes.
+        Datawrapper payloads lead with a single-cell banner row (the chart
+        title) and, for NSS/NAS tables, several sparse sub-title rows above
+        the real column header. We must NOT let pandas sniff the delimiter
+        from that first line: on banner tables it guesses "1 column" and then
+        raises "Expected 1 fields, saw N" on the first wide data row, which
+        used to drop us into the lossy DOM-scrape fallback (banner mistaken
+        for the header, paginated row subset, Datawrapper-formatted display
+        values like '6.0' for '6021').
+
+        Parse with the stdlib csv reader instead: it tolerates ragged rows,
+        and we choose the delimiter by counting candidates across the whole
+        payload (comma for dataset.csv, tab for the .tsv variant). The shared
+        header picker in modules.header_detect then locates the real header.
         """
+        if not text or not text.strip():
+            return {"headers": [], "rows": []}
+
+        delim = "\t" if text.count("\t") > text.count(",") else ","
         try:
-            # Read with no header so we can pick the right one ourselves.
-            df = pd.read_csv(
-                StringIO(text), sep=None, engine="python",
-                dtype=str, header=None, keep_default_na=False,
-            )
+            raw = [list(r) for r in csv.reader(StringIO(text), delimiter=delim)]
         except Exception as e:
             log.error("CSV parse failed: %s", e)
             return {"headers": [], "rows": []}
 
-        df = df.fillna("").astype(str)
-        for col in df.columns:
-            df[col] = df[col].str.strip()
+        # Rows are ragged — the banner row has one cell, data rows have many.
+        # Pad every row to the widest so positional column alignment holds.
+        width = max((len(r) for r in raw), default=0)
+        all_rows = [[c.strip() for c in r] + [""] * (width - len(r)) for r in raw]
+        if not all_rows:
+            return {"headers": [], "rows": []}
 
-        all_rows = [list(r) for r in df.values.tolist()]
         header_idx = pick_header_idx(all_rows)
-
-        headers = list(all_rows[header_idx]) if all_rows else []
+        headers = list(all_rows[header_idx])
         rows = all_rows[header_idx + 1:]
         # Drop trailing all-empty rows
         while rows and not any(c for c in rows[-1]):

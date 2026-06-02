@@ -59,10 +59,11 @@ def _raw_excel_dump(path, lines):
         lines.append(f"  pandas read FAILED: {e!r}")
 
 
-def diag(dataset_substr: str, max_tables: int):
+def diag(dataset_substr: str, max_tables: int, target_tno: str = ""):
     acro = dataset_substr.strip().split()[-1].lower()
     out_path = _HERE / f"diag_{acro}.txt"
-    lines = [f"DATASET FILTER: {dataset_substr!r}", "=" * 70]
+    lines = [f"DATASET FILTER: {dataset_substr!r}"
+             + (f"  TARGET table_no: {target_tno!r}" if target_tno else ""), "=" * 70]
 
     with BrowserManager(headless=True, download_dir=_DL, slow_mo=0) as bm:
         bm.page.set_default_timeout(60_000)
@@ -85,6 +86,35 @@ def diag(dataset_substr: str, max_tables: int):
         dp.wait_for_table()
         rows = dp.get_rows()
         dataset_url = bm.page.url
+
+        # If a target table_no is given, paginate until we find it.
+        if target_tno:
+            found = None
+            page_n = 1
+            while True:
+                rows = dp.get_rows()
+                # match by exact table_no OR (if target ends with '*') prefix
+                if target_tno.endswith("*"):
+                    pfx = target_tno[:-1]
+                    hit = next((r for r in rows if str(r.get("table_no", "")).startswith(pfx)), None)
+                else:
+                    hit = next((r for r in rows if r.get("table_no") == target_tno), None)
+                if hit:
+                    found = [hit]
+                    dataset_url = bm.page.url
+                    break
+                if not dp.has_next_page() or not dp.go_to_next_page():
+                    break
+                page_n += 1
+                if page_n > 200:
+                    break
+            if not found:
+                lines.append(f"target table_no {target_tno!r} not found in {page_n} pages")
+                out_path.write_text("\n".join(lines), encoding="utf-8")
+                print(f"Wrote {out_path}")
+                return
+            rows = found
+            max_tables = 1
 
         for i, row_meta in enumerate(rows[:max_tables]):
             tno = row_meta.get("table_no", str(i))
@@ -178,4 +208,5 @@ def diag(dataset_substr: str, max_tables: int):
 if __name__ == "__main__":
     substr = sys.argv[1] if len(sys.argv) > 1 else "PERIODIC LABOUR FORCE SURVEY PLFS"
     n = int(sys.argv[2]) if len(sys.argv) > 2 else 1
-    diag(substr, n)
+    tno = sys.argv[3] if len(sys.argv) > 3 else ""
+    diag(substr, n, tno)

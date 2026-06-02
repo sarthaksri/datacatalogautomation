@@ -1,3 +1,4 @@
+import base64
 import logging
 import re
 import time
@@ -5,6 +6,8 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from playwright.sync_api import Download, Page
+
+import config
 
 log = logging.getLogger(__name__)
 
@@ -214,6 +217,59 @@ class DatasetPage:
             return False
         return head.startswith(cls._XLSX_MAGIC) or head.startswith(cls._XLS_MAGIC)
 
+    # JS run inside the page: fetch the file through the browser's own network
+    # stack (the only thing that copes with MoSPI's legacy SSL renegotiation —
+    # Playwright's APIRequestContext trips on it) and hand the bytes back as
+    # base64 so Python can write them out verbatim.
+    _FETCH_B64_JS = """
+        async (u) => {
+            try {
+                const r = await fetch(u);
+                if (!r.ok) return {error: 'HTTP ' + r.status};
+                const bytes = new Uint8Array(await r.arrayBuffer());
+                let bin = '';
+                const CH = 0x8000;
+                for (let i = 0; i < bytes.length; i += CH) {
+                    bin += String.fromCharCode.apply(null, bytes.subarray(i, i + CH));
+                }
+                return {b64: btoa(bin), len: bytes.length};
+            } catch (e) { return {error: String(e)}; }
+        }
+    """
+
+    def _download_via_href(self, href: str, dest: Path) -> Optional[Path]:
+        """Fallback download: GET the link's href directly via in-page fetch.
+
+        The click + expect_download flow occasionally yields the SPA's HTML
+        shell instead of the file (most reliably on URLs containing '&', e.g.
+        '/datacatalogue/Women&MeninIndia/...'). The raw href, fetched through
+        the browser, returns the real spreadsheet — so we use it as a backstop
+        before declaring the Excel unreadable.
+        """
+        if not href:
+            return None
+        url = href if href.startswith("http") else config.BASE_URL + (
+            href if href.startswith("/") else "/" + href
+        )
+        try:
+            res = self.page.evaluate(self._FETCH_B64_JS, url)
+        except Exception as e:
+            log.warning("Direct-href fetch crashed for %s: %s", url, e)
+            return None
+        if not res or "b64" not in res:
+            log.warning("Direct-href fetch failed for %s: %s", url, res)
+            return None
+        try:
+            dest.write_bytes(base64.b64decode(res["b64"]))
+        except Exception as e:
+            log.warning("Could not write direct-href download to %s: %s", dest, e)
+            return None
+        if self._looks_like_excel(dest):
+            log.info("Saved via direct-href fetch: %s (%s bytes)", dest, res.get("len"))
+            return dest
+        log.warning("Direct-href fetch for %s was not a spreadsheet either", url)
+        return None
+
     def download_excel(self, row_index: int, table_name: str, table_no: str) -> Optional[Path]:
         """
         Click the download link and wait for the file to land on disk.
@@ -228,11 +284,14 @@ class DatasetPage:
         After the download completes we re-wait for the cards before
         returning, so the caller can safely interact with View Table next.
         """
-        safe = (f"{table_no}_{table_name}"[:80]
-                .replace("/", "_").replace("\\", "_")
-                .replace(" ", "_").replace(":", "_").replace("?", ""))
+        # Strip every character Windows forbids in a filename (< > : " / \ | ? *)
+        # plus whitespace. Earlier code missed '*', so tables like
+        # "...comprehensive knowledge* of HIV..." could never be written to
+        # disk and surfaced as "Excel file could not be read".
+        safe = re.sub(r'[<>:"/\\|?*\s]+', "_", f"{table_no}_{table_name}")[:80].rstrip("._")
         dest = self.download_dir / f"{safe}.xlsx"
 
+        href: Optional[str] = None
         attempts = 3
         for attempt in range(1, attempts + 1):
             card = self.page.locator(self.CARD_SEL).nth(row_index)
@@ -241,6 +300,14 @@ class DatasetPage:
             if link.count() == 0:
                 log.error("No download link on card %d", row_index)
                 return None
+
+            # Remember the href so we can fall back to a direct fetch if the
+            # click-based download keeps handing back the HTML shell.
+            if href is None:
+                try:
+                    href = link.get_attribute("href")
+                except Exception:
+                    href = None
 
             try:
                 log.info("Downloading Excel for [%s] %s (attempt %d/%d)",
@@ -281,8 +348,19 @@ class DatasetPage:
                     pass
                 time.sleep(1.0)
 
-        log.error("All %d download attempts for [%s] produced a non-Excel file",
-                  attempts, table_no)
+        log.warning(
+            "All %d click-downloads for [%s] produced a non-Excel file — "
+            "trying a direct fetch of the href", attempts, table_no,
+        )
+        viahref = self._download_via_href(href, dest)
+        if viahref is not None:
+            try:
+                self.wait_for_cards()
+            except Exception:
+                pass
+            return viahref
+
+        log.error("Could not obtain a valid spreadsheet for [%s]", table_no)
         return dest if dest.exists() else None
 
     def click_view_table(self, row_index: int) -> Optional[Page]:
