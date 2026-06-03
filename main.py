@@ -199,6 +199,17 @@ def run(
             catalogue.load()
             datasets = catalogue.get_datasets()
 
+            # The catalogue carries an aggregate "ALL DATASETS" card that just
+            # re-lists every other dataset's tables. Comparing it duplicates
+            # thousands of tables (and inflates the report), so always skip it.
+            before = len(datasets)
+            datasets = [
+                d for d in datasets
+                if not d["name"].strip().upper().startswith("ALL DATASETS")
+            ]
+            if len(datasets) < before:
+                log.info("Skipping the aggregate 'ALL DATASETS' card")
+
             if not datasets:
                 log.error(
                     "No dataset cards found. Check CATALOGUE_CARD_SELECTORS in config.py.\n"
