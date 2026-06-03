@@ -148,6 +148,36 @@ def _headers_equal(a: List[str], b: List[str]) -> bool:
     return all(_values_equal(x, y) for x, y in zip(a, b))
 
 
+_PLACEHOLDER_HDR_RE = re.compile(r"^\(?[+-]?\d+\)?$")
+
+
+def _is_placeholder_header(h: str) -> bool:
+    """True for a non-informative header slot: empty, or a bare column number.
+
+    NSS tables label their columns ``(1) (2) (3)…``; the web side keeps that
+    numbered row as its header while Excel keeps the *named* sub-header
+    (``Male/Female/Person`` etc.). When the two tables have the same number of
+    columns the comparison is positional, so a numbered placeholder on one side
+    against a real name on the other is not a genuine column conflict.
+    """
+    return not h or bool(_PLACEHOLDER_HDR_RE.match(h))
+
+
+def _headers_match_positional(a: List[str], b: List[str]) -> bool:
+    """Header equality for equal-length (positional) comparison.
+
+    Slots agree when their values are equal *or* either side is a placeholder
+    (empty / column-number). Lets a numbered web header line up with a named
+    Excel header without raising a false column mismatch.
+    """
+    if len(a) != len(b):
+        return False
+    return all(
+        _values_equal(x, y) or _is_placeholder_header(x) or _is_placeholder_header(y)
+        for x, y in zip(a, b)
+    )
+
+
 def _row_label(row: List[str], col_idx: int) -> str:
     """
     Build a short identifier for a data row, drawn from the cells preceding
@@ -343,7 +373,14 @@ def compare(excel_data: Optional[Dict], web_data: Optional[Dict]) -> ComparisonR
                 return result
 
     # ── Column comparison ────────────────────────────────────────────────────
-    if not _headers_equal(excel_hdrs, web_hdrs):
+    # When the column counts match the comparison is positional, so tolerate
+    # placeholder ("(1) (2)…") headers on one side against real names on the
+    # other. Only different counts or genuinely conflicting names are a problem.
+    if len(excel_hdrs) == len(web_hdrs):
+        headers_ok = _headers_match_positional(excel_hdrs, web_hdrs)
+    else:
+        headers_ok = False
+    if not headers_ok:
         log.warning("Column mismatch:\n  Excel: %s\n  Web:   %s", excel_hdrs, web_hdrs)
         result.col_mismatch = True
         # Report by named headers only; empty headers are merged-cell artefacts.

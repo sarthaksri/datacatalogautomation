@@ -4,7 +4,7 @@ from typing import Dict, List, Optional
 
 import pandas as pd
 
-from modules.header_detect import pick_header_idx
+from modules.header_detect import pick_header_idx, is_serial_label_row
 
 log = logging.getLogger(__name__)
 
@@ -54,6 +54,15 @@ class ExcelHandler:
         rows: List[List[str]] = all_rows[header_idx + 1:]
         while rows and not any(c for c in rows[-1]):
             rows.pop()
+
+        # NSS tables carry a "(1) (2) (3)…" column-number row right under the
+        # header. Excel stores it as -1,-2,-3… so pick_header_idx couldn't see
+        # it as a header and left it as the first data row. Drop it and treat
+        # it as part of the header (bump the index so A1 cell refs stay right),
+        # matching how the web table consumes that row as its header.
+        if rows and is_serial_label_row(rows[0]):
+            rows = rows[1:]
+            header_idx += 1
 
         log.info(
             "Excel read: %d rows × %d cols from %s (header row %d)",

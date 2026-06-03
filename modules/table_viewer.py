@@ -10,7 +10,7 @@ from typing import Dict, List, Optional, Tuple
 import pandas as pd
 from playwright.sync_api import Page
 
-from modules.header_detect import pick_header_idx
+from modules.header_detect import pick_header_idx, is_serial_label_row
 
 log = logging.getLogger(__name__)
 
@@ -217,6 +217,12 @@ class TableViewer:
         # Drop trailing all-empty rows
         while rows and not any(c for c in rows[-1]):
             rows.pop()
+
+        # Drop a leading "(1) (2) (3)…" column-number key row if the web table
+        # exposes it as data (the Excel side strips the same row), so the two
+        # stay row-aligned.
+        if rows and is_serial_label_row(rows[0]):
+            rows = rows[1:]
 
         return {"headers": headers, "rows": rows}
 
